@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ms-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ms-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: auth-service
+      PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/auth_db?sslmode=disable
+      REDIS_ADDR: redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+
+  team-service:
+    build:
+      context: ./team-service
+      dockerfile: Dockerfile
+    container_name: team-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: team-service
+      PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/team_db?sslmode=disable
+      REDIS_ADDR: redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+
+  asset-service:
+    build:
+      context: ./asset-service
+      dockerfile: Dockerfile
+    container_name: asset-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: asset-service
+      PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/asset_db?sslmode=disable
+      REDIS_ADDR: redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+
+volumes:
+  postgres_data:
