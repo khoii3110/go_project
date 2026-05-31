@@ -1,3 +1,5 @@
 CREATE DATABASE auth_db;
 CREATE DATABASE team_db;
 CREATE DATABASE asset_db;
+CREATE DATABASE audit_db;
+

@@ -1,11 +1,15 @@
 package user
 
 import (
+	"bytes"
+	"encoding/csv"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -33,6 +37,7 @@ type Service interface {
 	Logout(ctx context.Context, sessionID string) error
 	ListUsers(ctx context.Context) ([]User, error)
 	Authenticate(ctx context.Context, rawToken string) (*AuthContext, error)
+	ImportUsers(ctx context.Context, req ImportUsersRequest) (*ImportUsersSummary, error)
 }
 
 type AuthService struct {
@@ -52,6 +57,19 @@ type LoginResponse struct {
 	AccessToken string `json:"accessToken"`
 	TokenType   string `json:"tokenType"`
 	ExpiresIn   int64  `json:"expiresIn"`
+}
+
+type ImportUsersRequest struct {
+	Filename    string
+	ContentType  string
+	CSVContents  []byte
+	UploadedByID string
+}
+
+type ImportUsersSummary struct {
+	Succeeded int      `json:"succeeded"`
+	Failed    int      `json:"failed"`
+	Errors    []string `json:"errors"`
 }
 
 type AuthContext struct {
@@ -210,6 +228,128 @@ func (s *AuthService) Authenticate(ctx context.Context, rawToken string) (*AuthC
 		UserID:    claims.UserID,
 		Role:      claims.Role,
 		SessionID: claims.ID,
+	}, nil
+}
+
+type importJob struct {
+	RowNumber int
+	Record    []string
+}
+
+type importResult struct {
+	RowNumber int
+	Err       error
+}
+
+func (s *AuthService) ImportUsers(ctx context.Context, req ImportUsersRequest) (*ImportUsersSummary, error) {
+	if len(bytes.TrimSpace(req.CSVContents)) == 0 {
+		return nil, ErrInvalidInput
+	}
+
+	reader := csv.NewReader(bytes.NewReader(req.CSVContents))
+	reader.TrimLeadingSpace = true
+
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, ErrInvalidInput
+	}
+	if len(records) == 0 {
+		return nil, ErrInvalidInput
+	}
+
+	startIndex := 0
+	if looksLikeHeader(records[0]) {
+		startIndex = 1
+	}
+	if startIndex >= len(records) {
+		return nil, ErrInvalidInput
+	}
+
+	jobs := make(chan importJob)
+	results := make(chan importResult)
+	const workerCount = 5
+
+	var wg sync.WaitGroup
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		wg.Add(1)
+
+		// Each goroutine is a worker. A goroutine is a lightweight function that can run at the same time as other goroutines.
+		// We use 5 workers here so several CSV rows can be processed concurrently.
+		go func() {
+			defer wg.Done()
+
+			// The jobs channel is how the main loop sends CSV rows to workers.
+			// Each worker keeps reading from the channel until it is closed.
+			for job := range jobs {
+				if ctx.Err() != nil {
+					results <- importResult{RowNumber: job.RowNumber, Err: ctx.Err()}
+					continue
+				}
+
+				req, parseErr := parseImportRecord(job.Record)
+				if parseErr != nil {
+					results <- importResult{RowNumber: job.RowNumber, Err: parseErr}
+					continue
+				}
+
+				_, createErr := s.Register(ctx, req)
+				results <- importResult{RowNumber: job.RowNumber, Err: createErr}
+			}
+		}()
+	}
+
+	go func() {
+		// The main goroutine acts as the producer. It sends work items into the jobs channel.
+		for index := startIndex; index < len(records); index++ {
+			select {
+			case <-ctx.Done():
+				close(jobs)
+				return
+			case jobs <- importJob{RowNumber: index + 1, Record: records[index]}:
+			}
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	summary := &ImportUsersSummary{Errors: make([]string, 0)}
+	for result := range results {
+		if result.Err != nil {
+			summary.Failed++
+			summary.Errors = append(summary.Errors, fmt.Sprintf("row %d: %v", result.RowNumber, result.Err))
+			continue
+		}
+		summary.Succeeded++
+	}
+
+	return summary, nil
+}
+
+func looksLikeHeader(record []string) bool {
+	if len(record) < 4 {
+		return false
+	}
+	first := strings.ToLower(strings.TrimSpace(record[0]))
+	second := strings.ToLower(strings.TrimSpace(record[1]))
+	third := strings.ToLower(strings.TrimSpace(record[2]))
+	fourth := strings.ToLower(strings.TrimSpace(record[3]))
+	return first == "username" && second == "email" && third == "role" && fourth == "password"
+}
+
+func parseImportRecord(record []string) (CreateUserRequest, error) {
+	if len(record) < 4 {
+		return CreateUserRequest{}, ErrInvalidInput
+	}
+
+	return CreateUserRequest{
+		Username: strings.TrimSpace(record[0]),
+		Email:    strings.TrimSpace(record[1]),
+		Role:     strings.TrimSpace(record[2]),
+		Password: strings.TrimSpace(record[3]),
 	}, nil
 }
 

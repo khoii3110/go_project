@@ -3,6 +3,7 @@ package user
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -20,6 +21,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /login", h.login)
 	mux.HandleFunc("POST /logout", h.logout)
 	mux.HandleFunc("GET /users", h.listUsers)
+	mux.HandleFunc("POST /import-users", h.importUsers)
 }
 
 func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +103,56 @@ func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"users": users})
+}
+
+func (h *Handler) importUsers(w http.ResponseWriter, r *http.Request) {
+	authCtx, err := h.requireAuth(r)
+	if err != nil {
+		handleAuthError(w, err)
+		return
+	}
+	if authCtx.Role != RoleManager {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "manager role required"})
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart form"})
+		return
+	}
+
+	file, fileHeader, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "file field is required"})
+		return
+	}
+	defer file.Close()
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unable to read uploaded file"})
+		return
+	}
+
+	summary, err := h.service.ImportUsers(r.Context(), ImportUsersRequest{
+		Filename:    fileHeader.Filename,
+		ContentType:  fileHeader.Header.Get("Content-Type"),
+		CSVContents:  content,
+		UploadedByID: authCtx.UserID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidInput):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid csv file"})
+		case errors.Is(err, ErrForbidden):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func (h *Handler) requireAuth(r *http.Request) (*AuthContext, error) {

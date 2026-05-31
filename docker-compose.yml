@@ -11,6 +11,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./docker/postgres/02-audit.sql:/docker-entrypoint-initdb.d/02-audit.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -29,6 +30,22 @@ services:
       timeout: 3s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: ms-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   auth-service:
     build:
       context: ./auth-service
@@ -39,11 +56,16 @@ services:
       SERVICE_NAME: auth-service
       PORT: "8080"
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/auth_db?sslmode=disable
+      JWT_SECRET: dev-secret-change-me
+      JWT_ISSUER: auth-service
       REDIS_ADDR: redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     ports:
       - "8081:8080"
@@ -58,11 +80,18 @@ services:
       SERVICE_NAME: team-service
       PORT: "8080"
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/team_db?sslmode=disable
+      JWT_SECRET: dev-secret-change-me
+      JWT_ISSUER: auth-service
       REDIS_ADDR: redis:6379
+      REDIS_TEAM_MEMBER_LIST_PREFIX: team:{teamId}:members
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_TEAM_EXCHANGE: team.activity
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     ports:
       - "8082:8080"
@@ -78,13 +107,35 @@ services:
       PORT: "8080"
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/asset_db?sslmode=disable
       REDIS_ADDR: redis:6379
+      REDIS_ASSET_META_PREFIX: asset:{assetId}:meta
+      REDIS_ASSET_ACL_PREFIX: asset:{assetId}:acl
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_ASSET_EXCHANGE: asset.changes
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     ports:
       - "8083:8080"
+
+  audit-consumer:
+    build:
+      context: ./audit-consumer
+      dockerfile: Dockerfile
+    container_name: audit-consumer
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/audit_db?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      AUDIT_QUEUE: audit.events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   postgres_data:
